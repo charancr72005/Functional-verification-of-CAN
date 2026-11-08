@@ -1,0 +1,958 @@
+
+`timescale 1ns/1ps
+
+
+
+
+// ============================================================
+// 1. CAN INTERFACE
+// ============================================================
+
+interface CAN_interface(input logic clk);
+
+    // TX interface
+    logic        tx_valid;
+    logic        tx_ready;
+    logic [31:0] tx_data;
+
+    // RX interface
+    logic        rx_valid;
+    logic        rx_last;
+    logic [7:0]  rx_data;
+    logic [28:0] rx_id;
+    logic        rx_ide;
+
+    // CAN physical interface
+    logic can_rx;
+    logic can_tx;
+
+    // Driver modport
+    modport DRIVER (
+        input  clk,
+        input  tx_ready,
+        output tx_valid,
+        output tx_data
+    );
+
+    // Monitor modport
+    modport MONITOR (
+        input clk,
+        input rx_valid,
+        input rx_last,
+        input rx_data,
+        input rx_id,
+        input rx_ide
+    );
+
+endinterface
+
+
+// ============================================================
+// 2. TRANSACTION
+// ============================================================
+
+class can_transaction;
+
+    rand bit [31:0] tx_data;
+
+    // Receiver-side information
+    logic [28:0] rx_id;
+    logic        rx_ide;
+    int          byte_count;
+
+    function void display(string msg = "TRANSACTION");
+
+        $display("[%0t] %s : DATA = 0x%08h",
+                 $time, msg, tx_data);
+
+    endfunction
+
+endclass
+
+
+// ============================================================
+// 3. GENERATOR
+//
+// Generates transactions.
+//
+// First transaction:
+//     Directed = 32'h12345678
+//
+// Remaining transactions:
+//     Randomized
+//
+// Mailboxes:
+//     gen2drv -> Driver
+//     gen2scb -> Scoreboard
+// ============================================================
+
+class can_generator;
+
+    can_transaction can_trans;
+
+    mailbox #(can_transaction) gen2drv;
+    mailbox #(can_transaction) gen2scb;
+
+    int count;
+
+    function new(
+        mailbox #(can_transaction) gen2drv,
+        mailbox #(can_transaction) gen2scb,
+        int count
+    );
+
+        this.gen2drv = gen2drv;
+        this.gen2scb = gen2scb;
+        this.count   = count;
+
+    endfunction
+
+
+    task main();
+
+        for (int i = 0; i < count; i++) begin
+
+            can_trans = new();
+
+            if (i == 0) begin
+
+                can_trans.tx_data = 32'h12345678;
+
+            end
+
+            else begin
+
+                if (!can_trans.randomize()) begin
+
+                    $fatal(1,
+                        "[GENERATOR] Randomization failed");
+
+                end
+
+            end
+
+            // Send the transaction to the driver
+            gen2drv.put(can_trans);
+
+            // Send the expected transaction to scoreboard
+            gen2scb.put(can_trans);
+
+            can_trans.display("GENERATOR");
+
+        end
+
+        $display("\n[GENERATOR] Generated %0d transactions\n",
+                 count);
+
+    endtask
+
+endclass
+
+
+// ============================================================
+// 4. DRIVER
+//
+// Drives Node A.
+//
+// Handshake:
+//     tx_valid && tx_ready
+//
+// tx_valid remains HIGH until the DUT accepts the
+// transaction at a positive clock edge.
+// ============================================================
+
+class can_driver;
+
+    virtual CAN_interface.DRIVER vif;
+
+    mailbox #(can_transaction) gen2drv;
+
+    can_transaction can_trans;
+
+    function new(
+        virtual CAN_interface.DRIVER vif,
+        mailbox #(can_transaction) gen2drv
+    );
+
+        this.vif     = vif;
+        this.gen2drv = gen2drv;
+
+    endfunction
+
+
+    task main();
+
+        forever begin
+
+            // Receive transaction
+            gen2drv.get(can_trans);
+
+            // Drive on negative edge
+            @(negedge vif.clk);
+
+            vif.tx_data  <= can_trans.tx_data;
+            vif.tx_valid <= 1'b1;
+
+            can_trans.display("DRIVER");
+
+            // Wait for actual handshake
+            do begin
+
+                @(posedge vif.clk);
+
+            end while (
+                !(vif.tx_valid === 1'b1 &&
+                  vif.tx_ready === 1'b1)
+            );
+
+            // Deassert after successful handshake
+            @(negedge vif.clk);
+
+            vif.tx_valid <= 1'b0;
+
+        end
+
+    endtask
+
+endclass
+
+
+// ============================================================
+// 5. MONITOR
+//
+// Observes Node B's RX interface.
+//
+// The receiver outputs one byte at a time.
+//
+// Four bytes are reconstructed into one 32-bit transaction.
+//
+// rx_last indicates the last byte of a received packet.
+// ============================================================
+
+class can_monitor;
+
+    virtual CAN_interface.MONITOR vif;
+
+    mailbox #(can_transaction) mon2scb;
+
+    function new(
+        virtual CAN_interface.MONITOR vif,
+        mailbox #(can_transaction) mon2scb
+    );
+
+        this.vif     = vif;
+        this.mon2scb = mon2scb;
+
+    endfunction
+
+
+    task main();
+
+        logic [31:0] assembled_data;
+        int bytes_seen;
+
+        can_transaction actual;
+
+        assembled_data = 32'h0;
+        bytes_seen = 0;
+
+        forever begin
+
+            @(posedge vif.clk);
+
+            if (vif.rx_valid === 1'b1) begin
+
+                // Reconstruct the payload MSB first
+                assembled_data = {
+                    assembled_data[23:0],
+                    vif.rx_data
+                };
+
+                bytes_seen++;
+
+                $display(
+                    "[%0t] MONITOR : RX BYTE = 0x%02h LAST = %b",
+                    $time,
+                    vif.rx_data,
+                    vif.rx_last
+                );
+
+                if (vif.rx_last === 1'b1) begin
+
+                    actual = new();
+
+                    actual.tx_data    = assembled_data;
+                    actual.rx_id      = vif.rx_id;
+                    actual.rx_ide     = vif.rx_ide;
+                    actual.byte_count = bytes_seen;
+
+                    $display(
+                        "[%0t] MONITOR OBSERVED : DATA = 0x%08h ID = 0x%03h BYTES = %0d",
+                        $time,
+                        actual.tx_data,
+                        actual.rx_id[10:0],
+                        actual.byte_count
+                    );
+
+                    // Send actual transaction to scoreboard
+                    mon2scb.put(actual);
+
+                    // Reset for next packet
+                    assembled_data = 32'h0;
+                    bytes_seen = 0;
+
+                end
+
+            end
+
+        end
+
+    endtask
+
+endclass
+
+
+// ============================================================
+// 6. SCOREBOARD
+//
+// Compares:
+//     Expected transaction from generator
+//     Actual transaction from receiver monitor
+//
+// Checks:
+//     1. Payload
+//     2. CAN ID
+//     3. Standard/extended frame format
+//     4. Number of received bytes
+// ============================================================
+
+class can_scoreboard;
+
+    mailbox #(can_transaction) gen2scb;
+    mailbox #(can_transaction) mon2scb;
+
+    can_transaction expected;
+    can_transaction actual;
+
+    int count;
+    int completed;
+
+    int pass_count;
+    int fail_count;
+
+    logic [10:0] expected_id;
+
+    function new(
+        mailbox #(can_transaction) gen2scb,
+        mailbox #(can_transaction) mon2scb,
+        int count,
+        logic [10:0] expected_id
+    );
+
+        this.gen2scb     = gen2scb;
+        this.mon2scb     = mon2scb;
+        this.count       = count;
+        this.expected_id = expected_id;
+
+        completed  = 0;
+        pass_count = 0;
+        fail_count = 0;
+
+    endfunction
+
+
+    task main();
+
+        for (int i = 0; i < count; i++) begin
+
+            // Get expected data
+            gen2scb.get(expected);
+
+            // Get received data
+            mon2scb.get(actual);
+
+            if (
+                (expected.tx_data === actual.tx_data) &&
+                (actual.rx_id === {18'd0, expected_id}) &&
+                (actual.rx_ide === 1'b0) &&
+                (actual.byte_count == 4)
+            ) begin
+
+                $display(
+                    "[SCOREBOARD] PASS: Expected=%08h Actual=%08h ID=%03h",
+                    expected.tx_data,
+                    actual.tx_data,
+                    actual.rx_id[10:0]
+                );
+
+                pass_count++;
+
+            end
+
+            else begin
+
+                $display(
+                    "[SCOREBOARD] FAIL: Expected=%08h Actual=%08h ID=%03h BYTES=%0d IDE=%b",
+                    expected.tx_data,
+                    actual.tx_data,
+                    actual.rx_id[10:0],
+                    actual.byte_count,
+                    actual.rx_ide
+                );
+
+                fail_count++;
+
+            end
+
+            completed++;
+
+        end
+
+    endtask
+
+
+    function void report();
+
+        $display("\n");
+        $display("======================================");
+        $display("          SCOREBOARD REPORT");
+        $display("======================================");
+
+        $display("TOTAL TRANSACTIONS = %0d", count);
+        $display("PASS COUNT         = %0d", pass_count);
+        $display("FAIL COUNT         = %0d", fail_count);
+
+        if (pass_count == count && fail_count == 0)
+            $display("RESULT             = PASS");
+        else
+            $display("RESULT             = FAIL");
+
+        $display("======================================\n");
+
+    endfunction
+
+endclass
+
+
+// ============================================================
+// 7. ENVIRONMENT
+//
+// Instantiates all verification components.
+//
+// Connections:
+//
+//     Generator -> Driver
+//     Generator -> Scoreboard
+//     Monitor   -> Scoreboard
+// ============================================================
+
+class can_environment;
+
+    can_generator  gen;
+    can_driver     drv;
+    can_monitor    mon;
+    can_scoreboard scb;
+
+    mailbox #(can_transaction) gen2drv;
+    mailbox #(can_transaction) gen2scb;
+    mailbox #(can_transaction) mon2scb;
+
+    virtual CAN_interface.DRIVER  drv_vif;
+    virtual CAN_interface.MONITOR mon_vif;
+
+    int count;
+
+    logic [10:0] expected_id;
+
+
+    function new(
+        virtual CAN_interface.DRIVER drv_vif,
+        virtual CAN_interface.MONITOR mon_vif,
+        int count,
+        logic [10:0] expected_id
+    );
+
+        this.drv_vif    = drv_vif;
+        this.mon_vif    = mon_vif;
+        this.count      = count;
+        this.expected_id = expected_id;
+
+        // Create mailboxes
+        gen2drv = new();
+        gen2scb = new();
+        mon2scb = new();
+
+        // Create components
+        gen = new(gen2drv, gen2scb, count);
+
+        drv = new(drv_vif, gen2drv);
+
+        mon = new(mon_vif, mon2scb);
+
+        scb = new(
+            gen2scb,
+            mon2scb,
+            count,
+            expected_id
+        );
+
+    endfunction
+
+endclass
+
+
+// ============================================================
+// 8. TEST
+//
+// Starts generator, driver, monitor and scoreboard in
+// parallel.
+//
+// Waits until all transactions have been compared.
+// ============================================================
+
+class can_test;
+
+    can_environment env;
+
+    virtual CAN_interface.DRIVER  drv_vif;
+    virtual CAN_interface.MONITOR mon_vif;
+
+    int count;
+
+    logic [10:0] expected_id;
+
+
+    function new(
+        virtual CAN_interface.DRIVER drv_vif,
+        virtual CAN_interface.MONITOR mon_vif,
+        int count,
+        logic [10:0] expected_id
+    );
+
+        this.drv_vif    = drv_vif;
+        this.mon_vif    = mon_vif;
+        this.count      = count;
+        this.expected_id = expected_id;
+
+    endfunction
+
+
+    task run();
+
+        $display("\n======================================");
+        $display("          CAN TEST STARTED");
+        $display("======================================\n");
+
+        env = new(
+            drv_vif,
+            mon_vif,
+            count,
+            expected_id
+        );
+
+        // Start all components concurrently
+        fork
+
+            env.gen.main();
+
+            env.drv.main();
+
+            env.mon.main();
+
+            env.scb.main();
+
+        join_none
+
+        // Wait for all scoreboard comparisons
+        wait(env.scb.completed == count);
+
+        env.scb.report();
+
+        // Stop remaining background processes
+        disable fork;
+
+        $display("CAN TEST COMPLETED\n");
+
+    endtask
+
+endclass
+
+
+
+// ============================================================
+// 9. TOP-LEVEL TESTBENCH
+//
+// Two CAN controllers are connected to a shared bus.
+//
+// Node A:
+//     Transmitter
+//     ID = 0x456
+//
+// Node B:
+//     Receiver
+//     Accepts ID = 0x456
+//
+// CAN bus:
+//     Dominant   = 0
+//     Recessive  = 1
+//
+//     CAN_BUS = CAN_TX_A & CAN_TX_B
+// ============================================================
+
+module tb_top;
+
+    // --------------------------------------------------------
+    // TEST CONFIGURATION
+    // --------------------------------------------------------
+
+    localparam logic [10:0] TX_CAN_ID = 11'h456;
+
+    localparam int NUM_TRANSACTIONS = 10;
+
+    // CAN timing parameters
+    localparam [15:0] CAN_PTS  = 16'd34;
+    localparam [15:0] CAN_PBS1 = 16'd5;
+    localparam [15:0] CAN_PBS2 = 16'd10;
+
+
+    // --------------------------------------------------------
+    // GLOBAL SIGNALS
+    // --------------------------------------------------------
+
+    logic clk;
+    logic rstn;
+
+    CAN_interface tx_if(clk);
+    CAN_interface rx_if(clk);
+
+    wire can_bus;
+
+    virtual CAN_interface.DRIVER  drv_vif;
+    virtual CAN_interface.MONITOR mon_vif;
+
+    can_test test;
+
+    integer tx_ack_count = 0;
+
+
+    // --------------------------------------------------------
+    // CLOCK GENERATION
+    // --------------------------------------------------------
+
+    initial begin
+
+        clk = 1'b0;
+
+        forever #5 clk = ~clk;
+
+    end
+
+
+    // --------------------------------------------------------
+    // CAN BUS
+    // --------------------------------------------------------
+
+    assign can_bus = tx_if.can_tx & rx_if.can_tx;
+
+    assign tx_if.can_rx = can_bus;
+
+    assign rx_if.can_rx = can_bus;
+
+
+    // --------------------------------------------------------
+    // NODE A: TRANSMITTER
+    // --------------------------------------------------------
+
+    can_top #(
+
+        .LOCAL_ID(TX_CAN_ID),
+
+        .default_c_PTS(CAN_PTS),
+
+        .default_c_PBS1(CAN_PBS1),
+
+        .default_c_PBS2(CAN_PBS2)
+
+    ) dut_tx (
+
+        .rstn(rstn),
+
+        .clk(clk),
+
+        .can_rx(tx_if.can_rx),
+
+        .can_tx(tx_if.can_tx),
+
+        .tx_valid(tx_if.tx_valid),
+
+        .tx_ready(tx_if.tx_ready),
+
+        .tx_data(tx_if.tx_data),
+
+        .rx_valid(),
+
+        .rx_last(),
+
+        .rx_data(),
+
+        .rx_id(),
+
+        .rx_ide()
+
+    );
+
+
+    // --------------------------------------------------------
+    // NODE B: RECEIVER
+    //
+    // Receives only standard frames with ID 0x456.
+    // TX interface is disabled.
+    // --------------------------------------------------------
+
+    can_top #(
+
+        .LOCAL_ID(11'h123),
+
+        .RX_ID_SHORT_FILTER(TX_CAN_ID),
+
+        .RX_ID_SHORT_MASK(11'h7ff),
+
+        .default_c_PTS(CAN_PTS),
+
+        .default_c_PBS1(CAN_PBS1),
+
+        .default_c_PBS2(CAN_PBS2)
+
+    ) dut_rx (
+
+        .rstn(rstn),
+
+        .clk(clk),
+
+        .can_rx(rx_if.can_rx),
+
+        .can_tx(rx_if.can_tx),
+
+        .tx_valid(1'b0),
+
+        .tx_ready(),
+
+        .tx_data(32'd0),
+
+        .rx_valid(rx_if.rx_valid),
+
+        .rx_last(rx_if.rx_last),
+
+        .rx_data(rx_if.rx_data),
+
+        .rx_id(rx_if.rx_id),
+
+        .rx_ide(rx_if.rx_ide)
+
+    );
+
+
+    // --------------------------------------------------------
+    // ACK COUNTER
+    //
+    // pkt_tx_done and pkt_tx_acked are internal wires
+    // in can_top.
+    //
+    // Sampling on negedge avoids the race with nonblocking
+    // assignments made by the RTL at posedge.
+    // --------------------------------------------------------
+
+    always @(negedge clk or negedge rstn) begin
+
+        if (!rstn) begin
+
+            tx_ack_count <= 0;
+
+        end
+
+        else begin
+
+            if (
+                dut_tx.pkt_tx_done === 1'b1 &&
+                dut_tx.pkt_tx_acked === 1'b1
+            ) begin
+
+                tx_ack_count <= tx_ack_count + 1;
+
+                $display(
+                    "[%0t] TRANSMITTER: FRAME ACKNOWLEDGED. ACK COUNT = %0d",
+                    $time,
+                    tx_ack_count + 1
+                );
+
+            end
+
+        end
+
+    end
+
+
+    // --------------------------------------------------------
+    // MAIN TEST SEQUENCE
+    // --------------------------------------------------------
+
+    initial begin
+
+        // Initialize signals
+        rstn = 1'b0;
+
+        tx_if.tx_valid = 1'b0;
+        tx_if.tx_data  = 32'h0;
+
+        // Reset both nodes
+        repeat (10) @(negedge clk);
+
+        rstn = 1'b1;
+
+        $display("\n[TB] Reset released");
+
+        $display(
+            "[TB] Transmitter ID = 0x%03h",
+            TX_CAN_ID
+        );
+
+        $display(
+            "[TB] Number of transactions = %0d\n",
+            NUM_TRANSACTIONS
+        );
+
+
+        // Assign virtual interfaces
+        drv_vif = tx_if;
+
+        mon_vif = rx_if;
+
+
+        // Create test
+        test = new(
+            drv_vif,
+            mon_vif,
+            NUM_TRANSACTIONS,
+            TX_CAN_ID
+        );
+
+
+        // Run layered testbench
+        test.run();
+
+
+        // ----------------------------------------------------
+        // WAIT FOR ALL ACKNOWLEDGEMENTS
+        //
+        // RX data delivery can complete before the transmitter
+        // has sampled the final ACK.
+        //
+        // Therefore, do not check the ACK count immediately
+        // after the scoreboard finishes.
+        // ----------------------------------------------------
+
+        $display("\n[TB] Waiting for all CAN acknowledgements...");
+
+        fork : ACK_COMPLETION
+
+            begin
+
+                wait (tx_ack_count == NUM_TRANSACTIONS);
+
+            end
+
+            begin
+
+                // Local ACK timeout
+                repeat (1000) @(posedge clk);
+
+                if (tx_ack_count != NUM_TRANSACTIONS) begin
+
+                    $fatal(
+                        1,
+                        "ACK TIMEOUT: Expected %0d ACKs, received %0d",
+                        NUM_TRANSACTIONS,
+                        tx_ack_count
+                    );
+
+                end
+
+            end
+
+        join_any
+
+        disable ACK_COMPLETION;
+
+
+        // ----------------------------------------------------
+        // ACK REPORT
+        // ----------------------------------------------------
+
+        $display("\n======================================");
+        $display("          CAN ACK VERIFICATION");
+        $display("======================================");
+
+        $display(
+            "TRANSMITTER ACK COUNT = %0d",
+            tx_ack_count
+        );
+
+        if (tx_ack_count == NUM_TRANSACTIONS) begin
+
+            $display("ACK RESULT = PASS");
+
+        end
+
+        else begin
+
+            $display("ACK RESULT = FAIL");
+
+            $fatal(1, "CAN ACK VERIFICATION FAILED");
+
+        end
+
+
+        // ----------------------------------------------------
+        // OVERALL RESULT
+        // ----------------------------------------------------
+
+        if (
+            test.env.scb.pass_count == NUM_TRANSACTIONS &&
+            test.env.scb.fail_count == 0 &&
+            tx_ack_count == NUM_TRANSACTIONS
+        ) begin
+
+            $display("\n======================================");
+            $display("        OVERALL CAN TEST: PASS");
+            $display("======================================\n");
+
+        end
+
+        else begin
+
+            $fatal(1, "OVERALL CAN TEST: FAIL");
+
+        end
+
+
+        $finish;
+
+    end
+
+
+    // --------------------------------------------------------
+    // GLOBAL WATCHDOG
+    // --------------------------------------------------------
+
+    initial begin
+
+        #20_000_000;
+
+        $fatal(
+            1,
+            "GLOBAL TEST TIMEOUT"
+        );
+
+    end
+
+endmodule
